@@ -60,6 +60,8 @@ public class MainActivity extends Activity {
     private boolean showingA = true;
     private View nightOverlay;
     private FlipClockView clock;
+    private WeatherView weather;
+    private FrameLayout.LayoutParams weatherParams;
     private FrameLayout.LayoutParams clockParams;
     private TextView hint;
 
@@ -119,6 +121,12 @@ public class MainActivity extends Activity {
         clockParams = new FrameLayout.LayoutParams(600, FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
         root.addView(clock, clockParams);
+
+        weather = new WeatherView(this);
+        weather.setVisibility(View.GONE);
+        weatherParams = new FrameLayout.LayoutParams(600, FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM | Gravity.END);
+        root.addView(weather, weatherParams);
 
         hint = new TextView(this);
         hint.setTextColor(Color.WHITE);
@@ -185,9 +193,38 @@ public class MainActivity extends Activity {
         int w = root.getWidth(), h = root.getHeight();
         if (w == 0 || h == 0) return;
         boolean landscape = w > h;
-        clockParams.width = (int) (landscape ? w * 0.50f : w * 0.86f);
-        clockParams.bottomMargin = (int) (h * 0.06f);
+        boolean withWeather = weather.getVisibility() == View.VISIBLE;
+        int side = (int) (w * 0.04f), bottom = (int) (h * 0.06f);
+
+        if (!withWeather) {
+            clockParams.width = (int) (landscape ? w * 0.50f : w * 0.86f);
+            clockParams.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+            clockParams.leftMargin = 0;
+            clockParams.bottomMargin = bottom;
+        } else if (landscape) {
+            // Uhr unten links, Wetter unten rechts
+            clockParams.width = (int) (w * 0.42f);
+            clockParams.gravity = Gravity.BOTTOM | Gravity.START;
+            clockParams.leftMargin = side;
+            clockParams.bottomMargin = bottom;
+            weatherParams.width = (int) (w * 0.40f);
+            weatherParams.gravity = Gravity.BOTTOM | Gravity.END;
+            weatherParams.rightMargin = side;
+            weatherParams.bottomMargin = bottom;
+        } else {
+            // hochkant: Uhr über dem Wetter
+            int cw = (int) (w * 0.86f);
+            weatherParams.width = cw;
+            weatherParams.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+            weatherParams.rightMargin = 0;
+            weatherParams.bottomMargin = (int) (h * 0.04f);
+            clockParams.width = cw;
+            clockParams.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+            clockParams.leftMargin = 0;
+            clockParams.bottomMargin = weatherParams.bottomMargin + (int) WeatherView.heightFor(cw) + (int) (h * 0.025f);
+        }
         clock.setLayoutParams(clockParams);
+        weather.setLayoutParams(weatherParams);
     }
 
     /** Verschiebt die Uhr leicht, damit nichts ins AMOLED-Display einbrennt. */
@@ -196,6 +233,8 @@ public class MainActivity extends Activity {
         float dx = (random.nextFloat() * 2f - 1f) * w * 0.03f;
         float dy = -random.nextFloat() * h * 0.03f;
         clock.animate().translationX(dx).translationY(dy).setDuration(1500).start();
+        weather.animate().translationX(dx).translationY(dy).setDuration(1500)
+                .withEndAction(weather::invalidate).start();
     }
 
     private void hideSystemUi() {
@@ -274,7 +313,9 @@ public class MainActivity extends Activity {
         Uri u = images.get(index++);
         loader.execute(() -> {
             Bitmap bm = decode(u);
-            if (bm != null) handler.post(() -> crossfade(bm));
+            if (bm == null) return;
+            Bitmap blur = makeBackdrop(bm);
+            handler.post(() -> crossfade(bm, blur));
         });
     }
 
@@ -321,7 +362,45 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void crossfade(Bitmap bm) {
+    /** Kleines, weichgezeichnetes Abbild des Fotos für die Glasfelder. */
+    private static Bitmap makeBackdrop(Bitmap bm) {
+        try {
+            int w = Math.max(4, bm.getWidth() / 12), h = Math.max(4, bm.getHeight() / 12);
+            Bitmap small = Bitmap.createScaledBitmap(bm, w, h, true);
+            if (small == bm) small = bm.copy(Bitmap.Config.ARGB_8888, true);
+            int[] px = new int[w * h];
+            small.getPixels(px, 0, w, 0, 0, w, h);
+            for (int pass = 0; pass < 2; pass++) boxBlur(px, w, h, 2);
+            Bitmap out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            out.setPixels(px, 0, w, 0, 0, w, h);
+            small.recycle();
+            return out;
+        } catch (Exception | OutOfMemoryError e) {
+            return null;
+        }
+    }
+
+    private static void boxBlur(int[] px, int w, int h, int rad) {
+        int[] tmp = new int[px.length];
+        for (int dir = 0; dir < 2; dir++) {
+            int[] src = dir == 0 ? px : tmp, dst = dir == 0 ? tmp : px;
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++) {
+                    int r = 0, g = 0, b = 0, n = 0;
+                    for (int k = -rad; k <= rad; k++) {
+                        int xx = dir == 0 ? Math.min(w - 1, Math.max(0, x + k)) : x;
+                        int yy = dir == 1 ? Math.min(h - 1, Math.max(0, y + k)) : y;
+                        int c = src[yy * w + xx];
+                        r += (c >> 16) & 0xFF; g += (c >> 8) & 0xFF; b += c & 0xFF; n++;
+                    }
+                    dst[y * w + x] = 0xFF000000 | ((r / n) << 16) | ((g / n) << 8) | (b / n);
+                }
+            }
+        }
+    }
+
+    private void crossfade(Bitmap bm, Bitmap blur) {
+        if (blur != null) weather.setBackdrop(blur, bm.getWidth(), bm.getHeight(), prefs.getBoolean("fit", false));
         final ImageView in = showingA ? imgB : imgA;
         final ImageView out = showingA ? imgA : imgB;
         in.setImageBitmap(bm);
@@ -346,6 +425,7 @@ public class MainActivity extends Activity {
         boolean night = isNight();
         nightOverlay.setVisibility(night ? View.VISIBLE : View.GONE);
         clock.setAlpha(night ? 0.3f : 1f);
+        weather.setAlpha(night ? 0.3f : 1f);
         WindowManager.LayoutParams lp = getWindow().getAttributes();
         lp.screenBrightness = night ? 0.01f : WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE;
         getWindow().setAttributes(lp);
@@ -363,6 +443,7 @@ public class MainActivity extends Activity {
                 ? ImageView.ScaleType.FIT_CENTER : ImageView.ScaleType.CENTER_CROP;
         imgA.setScaleType(t);
         imgB.setScaleType(t);
+        if (weather != null) weather.setFit(prefs.getBoolean("fit", false));
     }
 
     private void applyClockVisibility() {
@@ -454,7 +535,11 @@ public class MainActivity extends Activity {
     private void fetchWeather() {
         String city = prefs.getString("city", "");
         if (city.isEmpty()) {
-            handler.post(() -> clock.setWeather("", "", "", ""));
+            handler.post(() -> {
+                clock.setWeather("", "", "", "");
+                weather.setVisibility(View.GONE);
+                layoutClock();
+            });
             return;
         }
         try {
@@ -477,15 +562,36 @@ public class MainActivity extends Activity {
             JSONObject f = new JSONObject(httpGet("https://api.open-meteo.com/v1/forecast?latitude=" + lat
                     + "&longitude=" + lon
                     + "&current=temperature_2m,weather_code,is_day"
-                    + "&daily=temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=1"));
+                    + "&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=5"));
             JSONObject cur = f.getJSONObject("current");
             JSONObject daily = f.getJSONObject("daily");
-            String temp = Math.round(cur.getDouble("temperature_2m")) + "°";
-            String range = Math.round(daily.getJSONArray("temperature_2m_max").getDouble(0)) + "° / "
-                    + Math.round(daily.getJSONArray("temperature_2m_min").getDouble(0)) + "°";
-            String icon = weatherIcon(cur.getInt("weather_code"), cur.optInt("is_day", 1) == 1);
+            JSONArray dates = daily.getJSONArray("time");
+            JSONArray codes = daily.getJSONArray("weather_code");
+            JSONArray maxs = daily.getJSONArray("temperature_2m_max");
+            JSONArray mins = daily.getJSONArray("temperature_2m_min");
+
+            java.text.SimpleDateFormat in = new java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US);
+            java.text.SimpleDateFormat out = new java.text.SimpleDateFormat("EE", java.util.Locale.GERMAN);
+            int n = Math.min(5, dates.length());
+            WeatherView.Day[] days = new WeatherView.Day[n];
+            for (int i = 0; i < n; i++) {
+                String label = i == 0 ? "Heute" : out.format(in.parse(dates.getString(i))).replace(".", "");
+                days[i] = new WeatherView.Day(label, codes.getInt(i),
+                        (int) Math.round(maxs.getDouble(i)), (int) Math.round(mins.getDouble(i)));
+            }
+            final int temp = (int) Math.round(cur.getDouble("temperature_2m"));
+            final int code = cur.getInt("weather_code");
+            final boolean day = cur.optInt("is_day", 1) == 1;
+            final int max = n > 0 ? days[0].max : temp, min = n > 0 ? days[0].min : temp;
             final String p = place;
-            handler.post(() -> clock.setWeather(p, icon, temp, range));
+            handler.post(() -> {
+                clock.setWeather("", "", "", "");
+                weather.setData(p, code, day, temp, max, min, days);
+                if (weather.getVisibility() != View.VISIBLE) {
+                    weather.setVisibility(View.VISIBLE);
+                    layoutClock();
+                }
+            });
         } catch (Exception ignored) {
             // kein Netz: alte Anzeige bleibt stehen
         }
