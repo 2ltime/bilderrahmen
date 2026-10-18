@@ -35,7 +35,8 @@ jobs:
 
       - name: Fehler anzeigen
         if: failure()
-        run: grep -E "error:|e: |What went wrong" -A2 build.log | head -40 | while IFS= read -r l; do echo "::error::$l"; done
+        run: |
+          grep -E "error:|e: |What went wrong" -A2 build.log | head -40 | while IFS= read -r l; do echo "::error::$l"; done
 
       - uses: actions/upload-artifact@v5
         with:
