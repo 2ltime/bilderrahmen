@@ -23,7 +23,18 @@ import android.view.View;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
+import android.widget.EditText;
 import android.widget.TextView;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 
 import java.io.InputStream;
 import java.util.ArrayList;
@@ -56,12 +67,20 @@ public class MainActivity extends Activity {
     private int index = 0;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final ExecutorService loader = Executors.newSingleThreadExecutor();
+    private final ExecutorService net = Executors.newSingleThreadExecutor();
     private final Random random = new Random();
 
     private final Runnable slide = new Runnable() {
         @Override public void run() {
             if (!isNight()) showNext();
             handler.postDelayed(this, intervalMs());
+        }
+    };
+
+    private final Runnable weatherTask = new Runnable() {
+        @Override public void run() {
+            net.execute(MainActivity.this::fetchWeather);
+            handler.postDelayed(this, 30 * 60_000);
         }
     };
 
@@ -124,6 +143,8 @@ public class MainActivity extends Activity {
         hideSystemUi();
         handler.removeCallbacks(nightCheck);
         handler.post(nightCheck);
+        handler.removeCallbacks(weatherTask);
+        handler.post(weatherTask);
         if (!images.isEmpty()) {
             handler.removeCallbacks(slide);
             handler.post(slide);
@@ -133,6 +154,7 @@ public class MainActivity extends Activity {
     @Override protected void onPause() {
         handler.removeCallbacks(slide);
         handler.removeCallbacks(nightCheck);
+        handler.removeCallbacks(weatherTask);
         super.onPause();
     }
 
@@ -163,7 +185,7 @@ public class MainActivity extends Activity {
         int w = root.getWidth(), h = root.getHeight();
         if (w == 0 || h == 0) return;
         boolean landscape = w > h;
-        clockParams.width = (int) (landscape ? w * 0.42f : w * 0.72f);
+        clockParams.width = (int) (landscape ? w * 0.50f : w * 0.86f);
         clockParams.bottomMargin = (int) (h * 0.06f);
         clock.setLayoutParams(clockParams);
     }
@@ -360,7 +382,8 @@ public class MainActivity extends Activity {
                 "Wechselintervall: " + INTERVAL_LABELS[prefs.getInt("interval", 1)],
                 "Nachtruhe: " + NIGHT_LABELS[nightIndex()],
                 "Bildanpassung: " + (prefs.getBoolean("fit", false) ? "Ganzes Bild" : "Bildschirm füllen"),
-                "Uhr anzeigen: " + (prefs.getBoolean("showClock", true) ? "Ja" : "Nein")
+                "Uhr anzeigen: " + (prefs.getBoolean("showClock", true) ? "Ja" : "Nein"),
+                "Wetter-Ort: " + (prefs.getString("city", "").isEmpty() ? "Aus" : prefs.getString("city", ""))
         };
         new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
                 .setTitle("Einstellungen")
@@ -377,6 +400,7 @@ public class MainActivity extends Activity {
                             prefs.edit().putBoolean("showClock", !prefs.getBoolean("showClock", true)).apply();
                             applyClockVisibility();
                             break;
+                        case 5: chooseCity(); break;
                     }
                 })
                 .show();
@@ -406,6 +430,91 @@ public class MainActivity extends Activity {
                     d.dismiss();
                 })
                 .show();
+    }
+
+    private void chooseCity() {
+        final EditText input = new EditText(this);
+        input.setSingleLine(true);
+        input.setHint("z. B. München");
+        input.setText(prefs.getString("city", ""));
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("Wetter-Ort (leer = kein Wetter)")
+                .setView(input)
+                .setPositiveButton("OK", (d, w) -> {
+                    prefs.edit().putString("city", input.getText().toString().trim())
+                            .remove("lat").remove("lon").remove("place").apply();
+                    net.execute(this::fetchWeather);
+                })
+                .setNegativeButton("Abbrechen", null)
+                .show();
+    }
+
+    // ---------- Wetter (Open-Meteo, ohne Anmeldung) ----------
+
+    private void fetchWeather() {
+        String city = prefs.getString("city", "");
+        if (city.isEmpty()) {
+            handler.post(() -> clock.setWeather("", "", "", ""));
+            return;
+        }
+        try {
+            String lat = prefs.getString("lat", null), lon = prefs.getString("lon", null);
+            String place = prefs.getString("place", city);
+            if (lat == null || lon == null) {
+                JSONObject geo = new JSONObject(httpGet("https://geocoding-api.open-meteo.com/v1/search?count=1&language=de&name="
+                        + URLEncoder.encode(city, "UTF-8")));
+                JSONArray res = geo.optJSONArray("results");
+                if (res == null || res.length() == 0) {
+                    handler.post(() -> clock.setWeather(city + " (nicht gefunden)", "", "", ""));
+                    return;
+                }
+                JSONObject r = res.getJSONObject(0);
+                lat = String.valueOf(r.getDouble("latitude"));
+                lon = String.valueOf(r.getDouble("longitude"));
+                place = r.optString("name", city);
+                prefs.edit().putString("lat", lat).putString("lon", lon).putString("place", place).apply();
+            }
+            JSONObject f = new JSONObject(httpGet("https://api.open-meteo.com/v1/forecast?latitude=" + lat
+                    + "&longitude=" + lon
+                    + "&current=temperature_2m,weather_code,is_day"
+                    + "&daily=temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=1"));
+            JSONObject cur = f.getJSONObject("current");
+            JSONObject daily = f.getJSONObject("daily");
+            String temp = Math.round(cur.getDouble("temperature_2m")) + "°";
+            String range = Math.round(daily.getJSONArray("temperature_2m_max").getDouble(0)) + "° / "
+                    + Math.round(daily.getJSONArray("temperature_2m_min").getDouble(0)) + "°";
+            String icon = weatherIcon(cur.getInt("weather_code"), cur.optInt("is_day", 1) == 1);
+            final String p = place;
+            handler.post(() -> clock.setWeather(p, icon, temp, range));
+        } catch (Exception ignored) {
+            // kein Netz: alte Anzeige bleibt stehen
+        }
+    }
+
+    private static String weatherIcon(int code, boolean day) {
+        if (code == 0) return day ? "☀️" : "🌙";
+        if (code <= 2) return day ? "⛅" : "☁️";
+        if (code == 3) return "☁️";
+        if (code == 45 || code == 48) return "🌫️";
+        if (code >= 51 && code <= 57) return "🌦️";
+        if ((code >= 61 && code <= 67) || (code >= 80 && code <= 82)) return "🌧️";
+        if ((code >= 71 && code <= 77) || code == 85 || code == 86) return "❄️";
+        if (code >= 95) return "⛈️";
+        return "☁️";
+    }
+
+    private static String httpGet(String url) throws Exception {
+        HttpURLConnection con = (HttpURLConnection) new URL(url).openConnection();
+        con.setConnectTimeout(10_000);
+        con.setReadTimeout(10_000);
+        try (BufferedReader r = new BufferedReader(new InputStreamReader(con.getInputStream(), StandardCharsets.UTF_8))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = r.readLine()) != null) sb.append(line);
+            return sb.toString();
+        } finally {
+            con.disconnect();
+        }
     }
 
     private void pickFolder() {

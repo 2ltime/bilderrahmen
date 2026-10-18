@@ -29,7 +29,13 @@ jobs:
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0"
 
       - name: APK bauen
-        run: gradle assembleDebug --stacktrace
+        run: |
+          set -o pipefail
+          gradle assembleDebug 2>&1 | tee build.log
+
+      - name: Fehler anzeigen
+        if: failure()
+        run: grep -E "error:|e: |What went wrong" -A2 build.log | head -40 | while IFS= read -r l; do echo "::error::$l"; done
 
       - uses: actions/upload-artifact@v5
         with:

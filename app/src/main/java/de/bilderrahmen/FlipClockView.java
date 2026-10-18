@@ -2,9 +2,13 @@ package de.bilderrahmen;
 
 import android.animation.ValueAnimator;
 import android.content.Context;
+import android.graphics.Bitmap;
+import android.graphics.Camera;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.LightingColorFilter;
 import android.graphics.LinearGradient;
+import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.RectF;
 import android.graphics.Shader;
@@ -12,32 +16,49 @@ import android.graphics.Typeface;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.View;
-import android.view.animation.AccelerateDecelerateInterpolator;
+import android.view.animation.AccelerateInterpolator;
 
 import java.text.SimpleDateFormat;
 import java.util.Calendar;
+import java.util.HashMap;
 import java.util.Locale;
 
-/** Klappzahlen-Uhr (HH:MM) mit Datum. Ziffern klappen beim Minutenwechsel um. */
+/**
+ * Klappuhr im klassischen Stil: zwei große Klappkarten (Stunden | Minuten) mit Scharnier,
+ * 3D-Klappanimation und einer Leiste mit Ort, Datum und Wetter darunter.
+ */
 public class FlipClockView extends View {
 
-    private final Paint cardPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint digitPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint hingePaint = new Paint();
-    private final Paint shadePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint shadowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint colonPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint datePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final RectF rect = new RectF();
+    private static final int FLIP_MS = 650;
 
-    private final String[] cur = {"", "", "", ""};
-    private final String[] prev = {"", "", "", ""};
-    private final float[] progress = {1f, 1f, 1f, 1f};
+    private final Paint bmpPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+    private final Paint flapPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+    private final Paint cardPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint glossPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint edgePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint digitPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint hingePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint pinPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint shadowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint barPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+    private final Camera camera = new Camera();
+    private final Matrix matrix = new Matrix();
+    private final RectF rect = new RectF();
+    private final HashMap<String, Bitmap> cache = new HashMap<>();
+
+    // 0 = Stunden, 1 = Minuten
+    private final String[] cur = {"", ""};
+    private final String[] prev = {"", ""};
+    private final float[] progress = {1f, 1f};
+    private final ValueAnimator[] anims = new ValueAnimator[2];
+
     private String dateText = "";
+    private String place = "", icon = "", temp = "", range = "";
     private final SimpleDateFormat dateFmt = new SimpleDateFormat("EEEE, d. MMMM", Locale.GERMAN);
 
-    private float cardW, cardH, gap, colonW, dateH, radius, hinge, baseline;
-    private ValueAnimator anim;
+    private float tileW, tileH, gap, radius, hinge, baseline, barTop, barH;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable tick = new Runnable() {
@@ -50,17 +71,29 @@ public class FlipClockView extends View {
 
     public FlipClockView(Context ctx) {
         super(ctx);
-        Typeface tf = Typeface.create("sans-serif-condensed", Typeface.BOLD);
-        digitPaint.setColor(0xFFF2F2F2);
-        digitPaint.setTypeface(tf);
+        digitPaint.setColor(0xFFF4F4F4);
+        digitPaint.setTypeface(Typeface.create("sans-serif-condensed", Typeface.BOLD));
         digitPaint.setTextAlign(Paint.Align.CENTER);
-        hingePaint.setColor(0xFF050505);
-        shadowPaint.setColor(0x77000000);
-        colonPaint.setColor(0xDDFFFFFF);
-        datePaint.setColor(Color.WHITE);
-        datePaint.setTypeface(Typeface.create("sans-serif", Typeface.NORMAL));
-        datePaint.setTextAlign(Paint.Align.CENTER);
-        datePaint.setShadowLayer(6f, 0f, 2f, 0xCC000000);
+
+        edgePaint.setStyle(Paint.Style.STROKE);
+        edgePaint.setColor(0x33FFFFFF);
+
+        hingePaint.setColor(0xFF070707);
+        pinPaint.setColor(0xFF6A6A6A);
+        shadowPaint.setColor(0x80000000);
+        barPaint.setColor(0x99000000);
+
+        textPaint.setColor(Color.WHITE);
+        textPaint.setShadowLayer(4f, 0f, 1.5f, 0xCC000000);
+    }
+
+    /** Wetterdaten setzen; leere Strings blenden das Wetter aus. */
+    public void setWeather(String place, String icon, String temp, String range) {
+        this.place = place == null ? "" : place;
+        this.icon = icon == null ? "" : icon;
+        this.temp = temp == null ? "" : temp;
+        this.range = range == null ? "" : range;
+        invalidate();
     }
 
     @Override protected void onAttachedToWindow() {
@@ -71,127 +104,212 @@ public class FlipClockView extends View {
 
     @Override protected void onDetachedFromWindow() {
         handler.removeCallbacks(tick);
-        if (anim != null) anim.cancel();
+        for (ValueAnimator a : anims) if (a != null) a.cancel();
         super.onDetachedFromWindow();
     }
 
+    // ---------- Maße ----------
+
     @Override protected void onMeasure(int widthSpec, int heightSpec) {
         int w = MeasureSpec.getSize(widthSpec);
-        float cw = w * 0.22f;
-        float ch = cw * 1.4f;
-        setMeasuredDimension(w, (int) (ch + ch * 0.32f));
+        float g = w * 0.03f;
+        float tw = (w - g) / 2f;
+        float th = tw * 0.80f;
+        float h = th + th * 0.08f + th * 0.36f;
+        setMeasuredDimension(w, (int) Math.ceil(h));
     }
 
     @Override protected void onSizeChanged(int w, int h, int ow, int oh) {
-        cardW = w * 0.22f;
-        gap = w * 0.02f;
-        colonW = w * 0.08f;
-        cardH = cardW * 1.4f;
-        dateH = cardH * 0.32f;
-        radius = cardW * 0.09f;
-        hinge = Math.max(2f, cardH * 0.012f);
+        gap = w * 0.03f;
+        tileW = (w - gap) / 2f;
+        tileH = tileW * 0.80f;
+        radius = tileW * 0.06f;
+        hinge = Math.max(2f, tileH * 0.014f);
+        barTop = tileH * 1.08f;
+        barH = tileH * 0.36f;
 
-        cardPaint.setShader(new LinearGradient(0, 0, 0, cardH,
-                new int[]{0xFF3E3E3E, 0xFF2A2A2A, 0xFF1E1E1E, 0xFF111111},
+        cardPaint.setShader(new LinearGradient(0, 0, 0, tileH,
+                new int[]{0xFF4A4A4A, 0xFF2B2B2B, 0xFF1F1F1F, 0xFF121212},
                 new float[]{0f, 0.5f, 0.5f, 1f}, Shader.TileMode.CLAMP));
-        digitPaint.setTextSize(cardH * 0.78f);
+        glossPaint.setShader(new LinearGradient(0, 0, 0, tileH / 2f,
+                0x26FFFFFF, 0x05FFFFFF, Shader.TileMode.CLAMP));
+        edgePaint.setStrokeWidth(Math.max(1f, tileH * 0.004f));
+
+        digitPaint.setTextSize(tileH * 0.78f);
+        digitPaint.setShadowLayer(tileH * 0.012f, 0f, tileH * 0.008f, 0xAA000000);
         Paint.FontMetrics fm = digitPaint.getFontMetrics();
-        baseline = cardH / 2f - (fm.ascent + fm.descent) / 2f;
-        datePaint.setTextSize(dateH * 0.55f);
+        baseline = tileH / 2f - (fm.ascent + fm.descent) / 2f;
+
+        camera.setLocation(0f, 0f, -tileH * 3f / 72f);
+        cache.clear();
     }
+
+    // ---------- Zeit ----------
 
     private void updateTime(boolean animate) {
         Calendar cal = Calendar.getInstance();
-        String t = String.format(Locale.GERMAN, "%02d%02d",
-                cal.get(Calendar.HOUR_OF_DAY), cal.get(Calendar.MINUTE));
+        String[] now = {
+                String.format(Locale.GERMAN, "%02d", cal.get(Calendar.HOUR_OF_DAY)),
+                String.format(Locale.GERMAN, "%02d", cal.get(Calendar.MINUTE))
+        };
         dateText = dateFmt.format(cal.getTime());
 
-        final boolean[] changed = new boolean[4];
-        boolean any = false;
-        for (int i = 0; i < 4; i++) {
-            String d = String.valueOf(t.charAt(i));
-            if (!d.equals(cur[i])) {
-                prev[i] = cur[i];
-                cur[i] = d;
-                changed[i] = true;
-                any = true;
-                progress[i] = animate ? 0f : 1f;
-            }
-        }
-        if (any && animate) {
-            anim = ValueAnimator.ofFloat(0f, 1f);
-            anim.setDuration(700);
-            anim.setInterpolator(new AccelerateDecelerateInterpolator());
-            anim.addUpdateListener(a -> {
-                float v = (float) a.getAnimatedValue();
-                for (int i = 0; i < 4; i++) if (changed[i]) progress[i] = v;
-                invalidate();
-            });
-            anim.start();
+        for (int i = 0; i < 2; i++) {
+            if (now[i].equals(cur[i])) continue;
+            prev[i] = cur[i];
+            cur[i] = now[i];
+            if (animate && !prev[i].isEmpty()) startFlip(i);
+            else progress[i] = 1f;
         }
         invalidate();
     }
 
-    @Override protected void onDraw(Canvas c) {
-        float x = 0f;
-        drawCard(c, x, 0); x += cardW + gap;
-        drawCard(c, x, 1); x += cardW;
-
-        float cx = x + colonW / 2f;
-        float dotR = cardW * 0.055f;
-        c.drawCircle(cx, cardH * 0.36f, dotR, colonPaint);
-        c.drawCircle(cx, cardH * 0.64f, dotR, colonPaint);
-        x += colonW;
-
-        drawCard(c, x, 2); x += cardW + gap;
-        drawCard(c, x, 3);
-
-        c.drawText(dateText, getWidth() / 2f, cardH + dateH * 0.72f, datePaint);
+    private void startFlip(final int i) {
+        if (anims[i] != null) anims[i].cancel();
+        progress[i] = 0f;
+        ValueAnimator a = ValueAnimator.ofFloat(0f, 1f);
+        a.setDuration(FLIP_MS);
+        a.setInterpolator(new AccelerateInterpolator(1.4f));
+        a.addUpdateListener(v -> {
+            progress[i] = (float) v.getAnimatedValue();
+            invalidate();
+        });
+        anims[i] = a;
+        a.start();
     }
 
-    private void drawCard(Canvas c, float x, int i) {
-        float p = progress[i];
-        String n = cur[i];
-        String o = prev[i];
+    // ---------- Zeichnen ----------
 
-        rect.set(x, cardH * 0.025f, x + cardW, cardH * 1.025f);
+    @Override protected void onDraw(Canvas c) {
+        if (tileW <= 0) return;
+        drawTile(c, 0f, 0);
+        drawTile(c, tileW + gap, 1);
+        drawBar(c);
+    }
+
+    private void drawTile(Canvas c, float x, int i) {
+        float mid = tileH / 2f;
+        String n = cur[i], o = prev[i];
+        float p = progress[i];
+
+        rect.set(x + tileW * 0.01f, tileH * 0.03f, x + tileW * 1.01f, tileH * 1.03f);
         c.drawRoundRect(rect, radius, radius, shadowPaint);
 
-        if (p >= 1f) {
-            drawHalf(c, x, n, true, 1f, 0f);
-            drawHalf(c, x, n, false, 1f, 0f);
+        if (p >= 1f || o.isEmpty()) {
+            c.drawBitmap(half(n, true), x, 0f, bmpPaint);
+            c.drawBitmap(half(n, false), x, mid, bmpPaint);
         } else if (p < 0.5f) {
-            // Phase 1: obere Hälfte der alten Ziffer klappt nach unten
-            float s = 1f - p / 0.5f;
-            drawHalf(c, x, n, true, 1f, 0f);
-            drawHalf(c, x, o, false, 1f, 0f);
-            drawHalf(c, x, o, true, s, (1f - s) * 0.6f);
+            // obere Hälfte der alten Zahl klappt nach vorne weg
+            float s = p / 0.5f;
+            drawShaded(c, half(n, true), x, 0f, 0.55f + 0.45f * s);
+            c.drawBitmap(half(o, false), x, mid, bmpPaint);
+            drawFlap(c, x, half(o, true), true, s * 90f, 1f - 0.45f * s);
         } else {
-            // Phase 2: untere Hälfte der neuen Ziffer klappt herunter
+            // untere Hälfte der neuen Zahl klappt herunter
             float s = (p - 0.5f) / 0.5f;
-            drawHalf(c, x, n, true, 1f, 0f);
-            drawHalf(c, x, o, false, 1f, (1f - s) * 0.35f);
-            drawHalf(c, x, n, false, s, (1f - s) * 0.6f);
+            c.drawBitmap(half(n, true), x, 0f, bmpPaint);
+            drawShaded(c, half(o, false), x, mid, 1f - 0.45f * (1f - s));
+            drawFlap(c, x, half(n, false), false, (1f - s) * 90f, 0.55f + 0.45f * s);
         }
 
-        float mid = cardH / 2f;
-        c.drawRect(x, mid - hinge / 2f, x + cardW, mid + hinge / 2f, hingePaint);
+        // Scharnier-Stifte links und rechts
+        float pinW = tileW * 0.022f, pinH = tileH * 0.13f;
+        rect.set(x - pinW * 0.45f, mid - pinH / 2f, x + pinW * 0.55f, mid + pinH / 2f);
+        c.drawRoundRect(rect, pinW / 2f, pinW / 2f, pinPaint);
+        rect.set(x + tileW - pinW * 0.55f, mid - pinH / 2f, x + tileW + pinW * 0.45f, mid + pinH / 2f);
+        c.drawRoundRect(rect, pinW / 2f, pinW / 2f, pinPaint);
     }
 
-    private void drawHalf(Canvas c, float x, String d, boolean top, float scaleY, float shade) {
-        if (scaleY <= 0.001f) return;
-        float mid = cardH / 2f;
-        c.save();
-        c.scale(1f, scaleY, x + cardW / 2f, mid);
-        if (top) c.clipRect(x, 0f, x + cardW, mid);
-        else c.clipRect(x, mid, x + cardW, cardH);
-        rect.set(x, 0f, x + cardW, cardH);
+    private void drawShaded(Canvas c, Bitmap bm, float x, float y, float bright) {
+        setBright(flapPaint, bright);
+        c.drawBitmap(bm, x, y, flapPaint);
+    }
+
+    private void drawFlap(Canvas c, float x, Bitmap bm, boolean top, float deg, float bright) {
+        if (deg >= 89.5f) return;
+        camera.save();
+        camera.rotateX(top ? -deg : deg);
+        camera.getMatrix(matrix);
+        camera.restore();
+        float hingeY = top ? bm.getHeight() : 0f;
+        matrix.preTranslate(-tileW / 2f, -hingeY);
+        matrix.postTranslate(x + tileW / 2f, tileH / 2f);
+        setBright(flapPaint, bright);
+        c.drawBitmap(bm, matrix, flapPaint);
+    }
+
+    private void setBright(Paint p, float b) {
+        int v = Math.max(0, Math.min(255, Math.round(b * 255f)));
+        p.setColorFilter(v >= 255 ? null : new LightingColorFilter(Color.rgb(v, v, v), 0));
+    }
+
+    /** Eine Kartenhälfte als Bild (wird zwischengespeichert). */
+    private Bitmap half(String text, boolean top) {
+        String key = text + (top ? "T" : "B");
+        Bitmap b = cache.get(key);
+        if (b != null) return b;
+        if (cache.size() > 16) cache.clear();
+
+        int w = Math.max(1, Math.round(tileW));
+        int h = Math.max(1, Math.round(tileH / 2f));
+        b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        Canvas c = new Canvas(b);
+        if (!top) c.translate(0f, -tileH / 2f);
+
+        rect.set(0f, 0f, tileW, tileH);
         c.drawRoundRect(rect, radius, radius, cardPaint);
-        c.drawText(d, x + cardW / 2f, baseline, digitPaint);
-        if (shade > 0f) {
-            shadePaint.setColor(Color.argb((int) (Math.min(1f, shade) * 255), 0, 0, 0));
-            c.drawRoundRect(rect, radius, radius, shadePaint);
+        if (top) c.drawRoundRect(rect, radius, radius, glossPaint);
+        c.drawText(text, tileW / 2f, baseline, digitPaint);
+        float e = edgePaint.getStrokeWidth() / 2f;
+        rect.set(e, e, tileW - e, tileH - e);
+        c.drawRoundRect(rect, radius, radius, edgePaint);
+        c.drawRect(0f, tileH / 2f - hinge / 2f, tileW, tileH / 2f + hinge / 2f, hingePaint);
+
+        cache.put(key, b);
+        return b;
+    }
+
+    private void drawBar(Canvas c) {
+        float w = getWidth();
+        rect.set(0f, barTop, w, barTop + barH);
+        c.drawRoundRect(rect, radius, radius, barPaint);
+
+        float pad = barH * 0.32f;
+
+        // links: Ort + Datum
+        textPaint.setTextAlign(Paint.Align.LEFT);
+        if (!place.isEmpty()) {
+            textPaint.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+            textPaint.setTextSize(barH * 0.34f);
+            c.drawText(place, pad, barTop + barH * 0.45f, textPaint);
+            textPaint.setTypeface(Typeface.create("sans-serif", Typeface.NORMAL));
+            textPaint.setTextSize(barH * 0.25f);
+            c.drawText(dateText, pad, barTop + barH * 0.80f, textPaint);
+        } else {
+            textPaint.setTypeface(Typeface.create("sans-serif", Typeface.NORMAL));
+            textPaint.setTextSize(barH * 0.34f);
+            c.drawText(dateText, pad, barTop + barH * 0.62f, textPaint);
         }
-        c.restore();
+
+        // rechts: Wetter
+        if (!temp.isEmpty()) {
+            float right = w - pad;
+            textPaint.setTextAlign(Paint.Align.RIGHT);
+
+            textPaint.setTypeface(Typeface.create("sans-serif-condensed", Typeface.BOLD));
+            textPaint.setTextSize(barH * 0.46f);
+            float tw = textPaint.measureText(temp);
+            c.drawText(temp, right, barTop + barH * 0.52f, textPaint);
+
+            textPaint.setTypeface(Typeface.create("sans-serif", Typeface.NORMAL));
+            textPaint.setTextSize(barH * 0.22f);
+            float rw = range.isEmpty() ? 0f : textPaint.measureText(range);
+            if (!range.isEmpty()) c.drawText(range, right, barTop + barH * 0.84f, textPaint);
+
+            if (!icon.isEmpty()) {
+                textPaint.setTextSize(barH * 0.58f);
+                c.drawText(icon, right - Math.max(tw, rw) - barH * 0.18f, barTop + barH * 0.72f, textPaint);
+            }
+        }
     }
 }
