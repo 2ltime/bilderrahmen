@@ -25,6 +25,8 @@ import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.EditText;
 import android.widget.TextView;
+import android.widget.Toast;
+import android.content.ClipData;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -37,6 +39,7 @@ import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Collections;
@@ -48,6 +51,7 @@ import java.util.concurrent.Executors;
 public class MainActivity extends Activity {
 
     private static final int REQ_FOLDER = 1;
+    private static final int REQ_ADD = 2;
 
     private static final String[] INTERVAL_LABELS = {"30 Sekunden", "1 Minute", "2 Minuten", "5 Minuten", "10 Minuten"};
     private static final long[] INTERVAL_MS = {30_000, 60_000, 120_000, 300_000, 600_000};
@@ -459,6 +463,7 @@ public class MainActivity extends Activity {
 
     private void showSettings() {
         String[] items = {
+                "Fotos hinzufügen (z. B. aus Google Fotos)",
                 "Bilderordner wählen",
                 "Wechselintervall: " + INTERVAL_LABELS[prefs.getInt("interval", 1)],
                 "Nachtruhe: " + NIGHT_LABELS[nightIndex()],
@@ -470,18 +475,19 @@ public class MainActivity extends Activity {
                 .setTitle("Einstellungen")
                 .setItems(items, (d, which) -> {
                     switch (which) {
-                        case 0: pickFolder(); break;
-                        case 1: chooseInterval(); break;
-                        case 2: chooseNight(); break;
-                        case 3:
+                        case 0: addPhotos(); break;
+                        case 1: pickFolder(); break;
+                        case 2: chooseInterval(); break;
+                        case 3: chooseNight(); break;
+                        case 4:
                             prefs.edit().putBoolean("fit", !prefs.getBoolean("fit", false)).apply();
                             applyScaleType();
                             break;
-                        case 4:
+                        case 5:
                             prefs.edit().putBoolean("showClock", !prefs.getBoolean("showClock", true)).apply();
                             applyClockVisibility();
                             break;
-                        case 5: chooseCity(); break;
+                        case 6: chooseCity(); break;
                     }
                 })
                 .show();
@@ -623,19 +629,108 @@ public class MainActivity extends Activity {
         }
     }
 
+    // ---------- Fotos hinzufügen (z. B. aus Google Fotos) ----------
+
+    private void addPhotos() {
+        if (prefs.getString("folder", null) == null) {
+            Toast.makeText(this, "Bitte zuerst einen Bilderordner wählen.", Toast.LENGTH_LONG).show();
+            pickFolder();
+            return;
+        }
+        Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+        i.setType("image/*");
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+        startActivityForResult(Intent.createChooser(i, "Fotos auswählen aus"), REQ_ADD);
+    }
+
+    private void importPhotos(final List<Uri> uris) {
+        final Uri tree = Uri.parse(prefs.getString("folder", ""));
+        hint.setText("Fotos werden kopiert … (0 / " + uris.size() + ")");
+        hint.setVisibility(View.VISIBLE);
+        loader.execute(() -> {
+            int ok = 0;
+            boolean noWrite = false;
+            long ts = System.currentTimeMillis();
+            Uri parent = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
+            for (int k = 0; k < uris.size(); k++) {
+                Uri src = uris.get(k);
+                try {
+                    String mime = getContentResolver().getType(src);
+                    if (mime == null || !mime.startsWith("image/")) mime = "image/jpeg";
+                    String ext = mime.contains("png") ? ".png"
+                            : (mime.contains("heic") || mime.contains("heif")) ? ".heic"
+                            : mime.contains("webp") ? ".webp" : ".jpg";
+                    Uri dst = DocumentsContract.createDocument(getContentResolver(), parent, mime,
+                            "foto_" + ts + "_" + k + ext);
+                    if (dst == null) { noWrite = true; continue; }
+                    try (InputStream in = getContentResolver().openInputStream(src);
+                         OutputStream out = getContentResolver().openOutputStream(dst)) {
+                        if (in == null || out == null) continue;
+                        byte[] buf = new byte[64 * 1024];
+                        int n;
+                        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                    }
+                    ok++;
+                    final int done = ok;
+                    handler.post(() -> hint.setText("Fotos werden kopiert … (" + done + " / " + uris.size() + ")"));
+                } catch (SecurityException e) {
+                    noWrite = true;
+                } catch (Exception ignored) { }
+            }
+            final int done = ok;
+            final boolean nw = noWrite;
+            handler.post(() -> {
+                hint.setVisibility(View.GONE);
+                if (done == 0 && nw) {
+                    new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                            .setTitle("Kein Schreibzugriff")
+                            .setMessage("Die App darf noch nicht in den Bilderordner schreiben. Bitte den Ordner einmal neu wählen und danach die Fotos erneut hinzufügen.")
+                            .setPositiveButton("Ordner wählen", (d, w) -> pickFolder())
+                            .setNegativeButton("Abbrechen", null)
+                            .show();
+                } else {
+                    Toast.makeText(this, done + (done == 1 ? " Foto" : " Fotos") + " hinzugefügt", Toast.LENGTH_LONG).show();
+                    scan(tree, true);
+                }
+            });
+        });
+    }
+
     private void pickFolder() {
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
-        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
         startActivityForResult(i, REQ_FOLDER);
     }
 
     @Override protected void onActivityResult(int req, int res, Intent data) {
         super.onActivityResult(req, res, data);
+        if (req == REQ_ADD) {
+            if (res != RESULT_OK || data == null) return;
+            List<Uri> picked = new ArrayList<>();
+            ClipData clip = data.getClipData();
+            if (clip != null) {
+                for (int k = 0; k < clip.getItemCount(); k++) {
+                    Uri u = clip.getItemAt(k).getUri();
+                    if (u != null) picked.add(u);
+                }
+            } else if (data.getData() != null) {
+                picked.add(data.getData());
+            }
+            if (!picked.isEmpty()) importPhotos(picked);
+            return;
+        }
         if (req != REQ_FOLDER || res != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData();
         try {
-            getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        } catch (SecurityException ignored) { }
+            getContentResolver().takePersistableUriPermission(uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        } catch (SecurityException e) {
+            try {
+                getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            } catch (SecurityException ignored) { }
+        }
         prefs.edit().putString("folder", uri.toString()).apply();
         hint.setText("Bilder werden geladen …");
         hint.setVisibility(View.VISIBLE);
